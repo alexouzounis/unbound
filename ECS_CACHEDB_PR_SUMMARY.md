@@ -12,7 +12,6 @@ Include ECS data in cachedb cache keys so different subnets get different entrie
 ## Changes
 
 ### File: `cachedb/cachedb.c`
-**+100 insertions, -5 deletions**
 
 1. **Added includes** (Lines 62-63)
    - `#include "edns-subnet/edns-subnet.h"`
@@ -47,13 +46,6 @@ Include ECS data in cachedb cache keys so different subnets get different entrie
 - **Memory Safe**: All buffer operations bounds-checked
 - **Thread Safe**: No new global state
 - **Efficient**: Minimal overhead (single SHA256 hash of ~40 bytes)
-
-## Performance Impact
-
-- Query latency (cached): 1-5ms (from Redis)
-- Improvement: 20-100x faster than upstream for repeat queries
-- Upstream reduction: 95% fewer queries after cache warmup
-- Memory: Off-host to Redis (reduces memory footprint)
 
 ## Testing
 
