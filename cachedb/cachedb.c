@@ -59,6 +59,10 @@
 #include "sldns/parseutil.h"
 #include "sldns/wire2str.h"
 #include "sldns/sbuffer.h"
+#ifdef CLIENT_SUBNET
+#include "edns-subnet/edns-subnet.h"
+#include "edns-subnet/subnetmod.h"
+#endif
 
 /* header file for htobe64 */
 #ifdef HAVE_ENDIAN_H
@@ -328,9 +332,12 @@ error_response(struct module_qstate* qstate, int id, int rcode)
  * @param buf: returned buffer with hash to lookup
  * @param len: length of the buffer.
  */
+/** 
+ * Hash a query info into a cache key buffer. Include ECS data if available.
+ */
 static void
 calc_hash(struct query_info* qinfo, struct module_env* env, char* buf,
-	size_t len)
+	size_t len, struct ecs_data* ecs)
 {
 	uint8_t clear[1024];
 	size_t clen = 0;
@@ -356,6 +363,36 @@ calc_hash(struct query_info* qinfo, struct module_env* env, char* buf,
 		memmove(clear+clen, secret, strlen(secret));
 		clen += strlen(secret);
 	}
+
+#ifdef CLIENT_SUBNET
+	/* Include ECS data in hash if present and valid */
+	if(ecs && ecs->subnet_validdata) {
+		if(clen + sizeof(ecs->subnet_addr_fam) < sizeof(clear)) {
+			memmove(clear+clen, &ecs->subnet_addr_fam, 
+				sizeof(ecs->subnet_addr_fam));
+			clen += sizeof(ecs->subnet_addr_fam);
+		}
+		if(clen + sizeof(ecs->subnet_source_mask) < sizeof(clear)) {
+			memmove(clear+clen, &ecs->subnet_source_mask,
+				sizeof(ecs->subnet_source_mask));
+			clen += sizeof(ecs->subnet_source_mask);
+		}
+		/* Include address bytes: 4 for IPv4, 16 for IPv6 */
+		if(ecs->subnet_addr_fam == EDNSSUBNET_ADDRFAM_IP4) {
+			/* IPv4: use first 4 bytes */
+			if(clen + 4 < sizeof(clear)) {
+				memmove(clear+clen, ecs->subnet_addr, 4);
+				clen += 4;
+			}
+		} else if(ecs->subnet_addr_fam == EDNSSUBNET_ADDRFAM_IP6) {
+			/* IPv6: use all 16 bytes */
+			if(clen + 16 < sizeof(clear)) {
+				memmove(clear+clen, ecs->subnet_addr, 16);
+				clen += 16;
+			}
+		}
+	}
+#endif
 	
 	/* hash the buffer */
 	secalgo_hash_sha256(clear, clen, hash);
@@ -647,7 +684,21 @@ cachedb_extcache_lookup(struct module_qstate* qstate, struct cachedb_env* ie,
 	int* msg_expired, time_t* msg_timestamp, time_t* msg_expiry)
 {
 	char key[(CACHEDB_HASHSIZE/8)*2+1];
-	calc_hash(&qstate->qinfo, qstate->env, key, sizeof(key));
+	struct ecs_data* ecs = NULL;
+
+#ifdef CLIENT_SUBNET
+	/* Extract ECS data from subnetmod state if available */
+	int subnet_id = modstack_find(qstate->env->modstack, "subnetcache");
+	if(subnet_id >= 0) {
+		struct subnet_qstate* subnet_state = 
+			(struct subnet_qstate*)qstate->minfo[subnet_id];
+		if(subnet_state) {
+			ecs = &subnet_state->ecs_client_in;
+		}
+	}
+#endif
+
+	calc_hash(&qstate->qinfo, qstate->env, key, sizeof(key), ecs);
 
 	/* call backend to fetch data for key into scratch buffer */
 	if( !(*ie->backend->lookup)(qstate->env, ie, key,
@@ -675,7 +726,21 @@ static void
 cachedb_extcache_store(struct module_qstate* qstate, struct cachedb_env* ie)
 {
 	char key[(CACHEDB_HASHSIZE/8)*2+1];
-	calc_hash(&qstate->qinfo, qstate->env, key, sizeof(key));
+	struct ecs_data* ecs = NULL;
+
+#ifdef CLIENT_SUBNET
+	/* Extract ECS data from subnetmod state if available */
+	int subnet_id = modstack_find(qstate->env->modstack, "subnetcache");
+	if(subnet_id >= 0) {
+		struct subnet_qstate* subnet_state = 
+			(struct subnet_qstate*)qstate->minfo[subnet_id];
+		if(subnet_state) {
+			ecs = &subnet_state->ecs_client_in;
+		}
+	}
+#endif
+
+	calc_hash(&qstate->qinfo, qstate->env, key, sizeof(key), ecs);
 
 	/* prepare data in scratch buffer */
 	if(!prep_data(qstate, qstate->env->scratch_buffer))
@@ -890,9 +955,38 @@ static void
 cachedb_handle_response(struct module_qstate* qstate,
 	struct cachedb_qstate* ATTR_UNUSED(iq), struct cachedb_env* ie, int id)
 {
+	struct ecs_data* ecs = NULL;
+	int allow_caching = 1;
+
 	qstate->is_cachedb_answer = 0;
+	
+#ifdef CLIENT_SUBNET
+	/* Check if we have ECS data - if so, allow caching despite no_cache_store
+	 * being set by subnetmod for ECS content segregation */
+	int subnet_id = modstack_find(qstate->env->modstack, "subnetcache");
+	if(subnet_id >= 0) {
+		struct subnet_qstate* subnet_state = 
+			(struct subnet_qstate*)qstate->minfo[subnet_id];
+		if(subnet_state && subnet_state->ecs_client_in.subnet_validdata) {
+			ecs = &subnet_state->ecs_client_in;
+			/* Allow storing ECS responses even if no_cache_store is set */
+			allow_caching = 1;
+		} else if(qstate->no_cache_store) {
+			/* no ECS data, respect no_cache_store for other reasons */
+			allow_caching = 0;
+		}
+	} else if(qstate->no_cache_store) {
+		allow_caching = 0;
+	}
+#else
+	/* Without CLIENT_SUBNET, respect no_cache_store as before */
+	if(qstate->no_cache_store) {
+		allow_caching = 0;
+	}
+#endif
+
 	/* check if we are not enabled or instructed to not cache, and skip */
-	if(!ie->enabled || qstate->no_cache_store) {
+	if(!ie->enabled || !allow_caching) {
 		/* we are done with the query */
 		qstate->ext_state[id] = module_finished;
 		return;
@@ -1031,7 +1125,8 @@ void cachedb_msg_remove_qinfo(struct module_env* env, struct query_info* qinfo)
 	struct cachedb_env* ie = (struct cachedb_env*)env->modinfo[id];
 
 	log_query_info(VERB_ALGO, "cachedb msg remove", qinfo);
-	calc_hash(qinfo, env, key, sizeof(key));
+	/* Pass NULL for ECS since we're removing by qinfo only */
+	calc_hash(qinfo, env, key, sizeof(key), NULL);
 	sldns_buffer_clear(env->scratch_buffer);
 	sldns_buffer_write_u32(env->scratch_buffer, 0);
 	sldns_buffer_flip(env->scratch_buffer);
